@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the /blend fingerprint directory REST endpoints."""
 
+# Standard
+import base64
+
 # Third Party
 from fastapi.testclient import TestClient
 
@@ -18,7 +21,7 @@ def _client() -> TestClient:
     return TestClient(create_app(config))
 
 
-def _range(prefix: str, tokens: list[int]) -> dict:
+def _range(prefix: str, tokens: list[int]) -> dict[str, object]:
     n_chunks = len(tokens) // CHUNK
     return {
         "model_scope": SCOPE,
@@ -87,15 +90,19 @@ def test_match_malformed_tokens_b64_returns_422():
         )
         assert resp.status_code == 422
 
-        # Valid base64 but not a whole number of uint32 tokens (3 bytes).
-        # Standard
-        import base64
-
+        # Valid base64 but not a whole number of uint64 tokens (4 bytes).
         resp = client.post(
             "/blend/match",
             json={
                 "model_scope": SCOPE,
-                "tokens_b64": base64.b64encode(b"\x01\x02\x03").decode("ascii"),
+                "tokens_b64": base64.b64encode(b"\x01\x02\x03\x04").decode("ascii"),
             },
         )
+        assert resp.status_code == 422
+
+
+def test_match_missing_token_payload_returns_422() -> None:
+    """A missing token payload is a client error, not an unhandled 500."""
+    with _client() as client:
+        resp = client.post("/blend/match", json={"model_scope": SCOPE})
         assert resp.status_code == 422

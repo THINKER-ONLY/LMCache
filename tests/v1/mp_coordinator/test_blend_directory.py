@@ -2,6 +2,7 @@
 """Tests for the coordinator global CacheBlend fingerprint directory."""
 
 # Standard
+import base64
 import threading
 
 # Third Party
@@ -76,6 +77,19 @@ class TestRegisterMatch:
         m = GlobalBlendMatcher(chunk_size=CHUNK)
         m.register([store_range("K", [1, 2, 3])])
         assert m.match(SCOPE, [7, 8, 9]) == []
+
+    def test_vlm_surrogate_identity_distinguishes_images(self) -> None:
+        m = GlobalBlendMatcher(chunk_size=CHUNK)
+        same_image_tokens = [101, 2**40 + 123, 2**40 + 123]
+        different_image_tokens = [101, 2**40 + 456, 2**40 + 456]
+
+        assert m.register([store_range("IMG", same_image_tokens)]) == 1
+
+        same_matches = m.match(SCOPE, same_image_tokens)
+        assert [(x.object_key, x.old_st, x.cur_st) for x in same_matches] == [
+            ("IMG0", 0, 0)
+        ]
+        assert m.match(SCOPE, different_image_tokens) == []
 
 
 class TestIdempotencyEviction:
@@ -233,7 +247,7 @@ class TestConcurrency:
 
 class TestTokenCodec:
     def test_round_trip(self) -> None:
-        tokens = [0, 1, 2, 65535, 2**31, 2**32 - 1]
+        tokens = [0, 1, 2, 65535, 2**31, 2**32 - 1, 2**32 + 7, 2**63 - 1]
         decoded = decode_tokens(encode_tokens(tokens))
         assert decoded.tolist() == tokens
 
@@ -252,8 +266,5 @@ class TestTokenCodec:
             decode_tokens("not valid base64 !!!")
 
     def test_bad_byte_length_raises(self) -> None:
-        # Standard
-        import base64
-
         with pytest.raises(ValueError):
-            decode_tokens(base64.b64encode(b"abc").decode())  # 3 bytes, not /4
+            decode_tokens(base64.b64encode(b"abcd").decode())  # 4 bytes, not /8

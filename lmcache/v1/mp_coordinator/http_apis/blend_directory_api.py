@@ -90,8 +90,9 @@ def evict_fingerprints(body: BlendEvictRequest, request: Request) -> BlendEvictR
 def match_fingerprints(body: BlendMatchRequest, request: Request) -> BlendMatchResponse:
     """Match a request's rolling-hash array against the directory.
 
-    The request tokens arrive base64-packed (``tokens_b64``); they are decoded
-    to a ``uint64`` array and handed straight to the matcher.
+    The request tokens arrive base64-packed (``tokens_b64``) as a little-endian
+    ``uint64`` buffer; they are decoded to a ``uint64`` array and handed
+    straight to the matcher.
 
     Returns:
         Matched chunks (``object_key`` / ``old_st`` / ``cur_st``), ascending by
