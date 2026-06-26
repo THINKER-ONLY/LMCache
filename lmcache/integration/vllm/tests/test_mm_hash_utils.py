@@ -7,8 +7,11 @@ import torch
 
 # First Party
 from lmcache.integration.vllm.utils import (
+    apply_mm_hashes_to_token_list,
     apply_mm_hashes_to_token_ids,
     hex_hash_to_int16,
+    hex_hash_to_int64,
+    get_mm_aware_token_ids,
 )
 
 
@@ -16,6 +19,34 @@ from lmcache.integration.vllm.utils import (
 class DummyPlaceholderRange:
     offset: int
     length: int
+
+
+@dataclasses.dataclass(frozen=True)
+class DummyMMFeature:
+    identifier: str
+    mm_position: DummyPlaceholderRange
+
+
+@dataclasses.dataclass
+class DummyRequest:
+    all_token_ids: list[int]
+    mm_features: list[DummyMMFeature] | None = None
+    mm_hashes: list[str] | None = None
+    mm_positions: list[DummyPlaceholderRange] | None = None
+
+
+def test_hex_hash_to_int64_accepts_hex_and_non_hex() -> None:
+    assert hex_hash_to_int64("0000") == 0
+    assert hex_hash_to_int64("0x0001") == 1
+    assert hex_hash_to_int64("0x10000") > 0xFFFF
+    assert hex_hash_to_int64("0xffffffffffffffff") == (2**63 - 1)
+
+    s = "chatcmpl-a2a48871c4aad192-image-0"
+    v1 = hex_hash_to_int64(s)
+    v2 = hex_hash_to_int64(s)
+    assert isinstance(v1, int)
+    assert 0 <= v1 < 2**63
+    assert v1 == v2
 
 
 def test_hex_hash_to_int16_accepts_hex_and_non_hex() -> None:
@@ -32,6 +63,7 @@ def test_hex_hash_to_int16_accepts_hex_and_non_hex() -> None:
     assert isinstance(v1, int)
     assert 0 <= v1 <= 0xFFFF
     assert v1 == v2
+    assert v1 == (hex_hash_to_int64(s) & 0xFFFF)
 
 
 def test_hex_hash_to_int16_hex_variants_whitespace_and_truncation() -> None:
@@ -70,6 +102,7 @@ def test_hex_hash_to_int16_non_string_inputs_are_safe() -> None:
         assert isinstance(v1, int)
         assert 0 <= v1 <= 0xFFFF
         assert v1 == v2
+        assert v1 == (hex_hash_to_int64(val) & 0xFFFF)
 
 
 def test_apply_mm_hashes_to_token_ids_handles_non_hex_mm_hash() -> None:
@@ -78,8 +111,9 @@ def test_apply_mm_hashes_to_token_ids_handles_non_hex_mm_hash() -> None:
     mm_positions = [DummyPlaceholderRange(offset=2, length=4)]
 
     out = apply_mm_hashes_to_token_ids(token_ids.clone(), mm_hashes, mm_positions)
-    expected_val = hex_hash_to_int16(mm_hashes[0])
+    expected_val = hex_hash_to_int64(mm_hashes[0])
     assert out[2:6].tolist() == [expected_val] * 4
+    assert expected_val > 0xFFFF
 
 
 def test_apply_mm_hashes_to_token_ids_out_of_bounds_is_safe() -> None:
@@ -102,11 +136,63 @@ def test_apply_mm_hashes_to_token_ids_multiple_placeholders_and_length_mismatch(
     ]
 
     out = apply_mm_hashes_to_token_ids(token_ids.clone(), mm_hashes, mm_positions)
-    v0 = hex_hash_to_int16(mm_hashes[0])
-    v1 = hex_hash_to_int16(mm_hashes[1])
+    v0 = hex_hash_to_int64(mm_hashes[0])
+    v1 = hex_hash_to_int64(mm_hashes[1])
 
     assert out[0:3].tolist() == [v0] * 3
     assert out[5:9].tolist() == [v1] * 4
     # Other regions remain unchanged.
     assert out[3:5].tolist() == [0, 0]
     assert out[9:12].tolist() == [0, 0, 0]
+
+
+def test_apply_mm_hashes_to_token_list_returns_rewritten_copy() -> None:
+    token_ids = [10, 11, 12, 13, 14]
+    mm_hashes = ["0x10000"]
+    mm_positions = [DummyPlaceholderRange(offset=1, length=3)]
+
+    out = apply_mm_hashes_to_token_list(token_ids, mm_hashes, mm_positions)
+
+    assert token_ids == [10, 11, 12, 13, 14]
+    assert out == [10, 0x10000, 0x10000, 0x10000, 14]
+
+
+def test_get_mm_aware_token_ids_text_only_returns_copy() -> None:
+    request = DummyRequest(all_token_ids=[1, 2, 3])
+
+    out = get_mm_aware_token_ids(request)
+
+    assert out == [1, 2, 3]
+    assert out is not request.all_token_ids
+
+
+def test_get_mm_aware_token_ids_uses_mm_features() -> None:
+    request = DummyRequest(
+        all_token_ids=[1, 2, 3, 4, 5],
+        mm_features=[
+            DummyMMFeature(
+                identifier="0x10000",
+                mm_position=DummyPlaceholderRange(offset=2, length=2),
+            )
+        ],
+    )
+
+    assert get_mm_aware_token_ids(request) == [1, 2, 0x10000, 0x10000, 5]
+
+
+def test_get_mm_aware_token_ids_uses_legacy_fields() -> None:
+    request = DummyRequest(
+        all_token_ids=[1, 2, 3, 4, 5, 6],
+        mm_hashes=["image-a", "image-b"],
+        mm_positions=[
+            DummyPlaceholderRange(offset=1, length=2),
+            DummyPlaceholderRange(offset=4, length=5),
+        ],
+    )
+
+    out = get_mm_aware_token_ids(request)
+
+    image_a = hex_hash_to_int64("image-a")
+    image_b = hex_hash_to_int64("image-b")
+    assert out == [1, image_a, image_a, 4, image_b, image_b]
+    assert request.all_token_ids == [1, 2, 3, 4, 5, 6]

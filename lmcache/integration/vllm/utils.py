@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+from collections.abc import Sequence
 import hashlib
 import os
 import string
 import threading
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -27,7 +28,7 @@ logger = init_logger(__name__)
 ENGINE_NAME = "vllm-instance"
 
 # Thread-safe singleton storage
-_config_instance: Optional[LMCacheEngineConfig] = None
+_config_instance: LMCacheEngineConfig | None = None
 _config_lock = threading.Lock()
 
 
@@ -140,42 +141,69 @@ def create_lmcache_ec_config() -> LMCacheEngineConfig:
     return load_ec_engine_config(base_config=lmcache_get_or_create_config())
 
 
-def hex_hash_to_int16(s: str) -> int:
-    """
-    Convert a hash identifier into a 16-bit integer.
+_INT64_MASK = (1 << 63) - 1
 
-    Historically, LMCache expected multimodal identifiers to be hex strings.
-    In practice (e.g., OpenAI-style multimodal requests), identifiers may be
-    arbitrary strings like `chatcmpl-...-image-0`. This function therefore:
-      - Parses hex strings (optionally prefixed with `0x`) as before, or
-      - Falls back to a stable string hash (SHA-256) when the input is not hex.
+
+def hex_hash_to_int64(value: object) -> int:
+    """Convert a multimodal identifier into a stable int64-safe value.
+
+    Args:
+        value: Identifier supplied by vLLM. Hex strings are parsed as integer
+            values; all other values are converted to strings and hashed.
+
+    Returns:
+        A deterministic integer in the signed-int64-safe range
+        ``0 <= value < 2**63``.
     """
     # Be defensive: vLLM may pass non-string identifiers.
-    s = "" if s is None else str(s)
-    s_stripped = s.strip()
+    value_str = "" if value is None else str(value)
+    value_stripped = value_str.strip()
 
     # Fast-path: pure hex (optionally 0x-prefixed).
-    hex_part = s_stripped[2:] if s_stripped.lower().startswith("0x") else s_stripped
+    hex_part = (
+        value_stripped[2:]
+        if value_stripped.lower().startswith("0x")
+        else value_stripped
+    )
     if hex_part and all(c in string.hexdigits for c in hex_part):
         try:
-            return int(hex_part, 16) & 0xFFFF
+            return int(hex_part, 16) & _INT64_MASK
         except ValueError:
             # Extremely unlikely (e.g., oversized/odd formatting); fall back to hashing.
             pass
 
-    # Fallback: stable 16-bit value derived from the full identifier string.
-    digest = hashlib.sha256(s_stripped.encode("utf-8")).digest()
-    return int.from_bytes(digest[:2], byteorder="big", signed=False)
+    # Fallback: stable int64-safe value derived from the full identifier string.
+    digest = hashlib.sha256(value_stripped.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) & _INT64_MASK
+
+
+def hex_hash_to_int16(value: object) -> int:
+    """Convert a multimodal identifier into a compatibility 16-bit value.
+
+    Args:
+        value: Identifier supplied by vLLM.
+
+    Returns:
+        The low 16 bits of :func:`hex_hash_to_int64`.
+    """
+    return hex_hash_to_int64(value) & 0xFFFF
 
 
 def apply_mm_hashes_to_token_ids(
     token_ids: torch.Tensor,
-    mm_hashes: list[str],
-    mm_positions: list["PlaceholderRange"],
+    mm_hashes: Sequence[object],
+    mm_positions: Sequence["PlaceholderRange"],
 ) -> torch.Tensor:
-    """
-    Overwrite token_ids in-place for multimodal placeholders using
-    efficient slice assignments.
+    """Overwrite multimodal placeholder spans in a token tensor in place.
+
+    Args:
+        token_ids: Token tensor to rewrite. The tensor must be able to hold
+            signed int64-safe surrogate ids.
+        mm_hashes: Multimodal identifiers parallel to ``mm_positions``.
+        mm_positions: Placeholder spans to replace.
+
+    Returns:
+        The same tensor object, rewritten in place.
     """
     n = token_ids.size(0)
     for hash_str, placeholder in zip(mm_hashes, mm_positions, strict=False):
@@ -183,8 +211,53 @@ def apply_mm_hashes_to_token_ids(
         if start >= n:
             continue
         end = min(start + length, n)
-        token_ids[start:end] = hex_hash_to_int16(hash_str)
+        token_ids[start:end] = hex_hash_to_int64(hash_str)
     return token_ids
+
+
+def apply_mm_hashes_to_token_list(
+    token_ids: list[int],
+    mm_hashes: Sequence[object],
+    mm_positions: Sequence["PlaceholderRange"],
+) -> list[int]:
+    """Return a copy of token ids with multimodal placeholders rewritten.
+
+    Args:
+        token_ids: Raw token ids from vLLM.
+        mm_hashes: Multimodal identifiers parallel to ``mm_positions``.
+        mm_positions: Placeholder spans to replace.
+
+    Returns:
+        A new list where placeholder spans contain stable int64-safe
+        multimodal surrogate ids. The input list is not modified.
+    """
+    rewritten = list(token_ids)
+    n = len(rewritten)
+    for hash_str, placeholder in zip(mm_hashes, mm_positions, strict=False):
+        start, length = placeholder.offset, placeholder.length
+        if start >= n:
+            continue
+        end = min(start + length, n)
+        rewritten[start:end] = [hex_hash_to_int64(hash_str)] * (end - start)
+    return rewritten
+
+
+def get_mm_aware_token_ids(request: "Request") -> list[int]:
+    """Return request token ids with multimodal placeholders rewritten.
+
+    Args:
+        request: vLLM request exposing ``all_token_ids`` and optionally
+            ``mm_features`` or legacy ``mm_hashes`` / ``mm_positions``.
+
+    Returns:
+        A new token-id list suitable for LMCache cache keys and CacheBlend
+        matching.
+    """
+    token_ids = list(request.all_token_ids)
+    mm_hashes, mm_positions = extract_mm_features(request)
+    if not mm_hashes or not mm_positions:
+        return token_ids
+    return apply_mm_hashes_to_token_list(token_ids, mm_hashes, mm_positions)
 
 
 def mla_enabled(model_config: "ModelConfig") -> bool:
@@ -285,7 +358,7 @@ def create_lmcache_metadata(
 
 def extract_mm_features(
     request: "Request", modify: bool = False
-) -> Tuple[list[str], list["PlaceholderRange"]]:
+) -> tuple[list[str], list["PlaceholderRange"]]:
     """
     Normalize multimodal information from a Request into parallel lists.
 
@@ -339,7 +412,7 @@ def get_size_bytes(shapes: list[torch.Size], kv_dtypes: list[torch.dtype]):
     )
 
 
-def calculate_local_rank_and_world_size(vllm_config: "VllmConfig") -> Tuple[int, int]:
+def calculate_local_rank_and_world_size(vllm_config: "VllmConfig") -> tuple[int, int]:
     """
     Calculate the local worker id and local world size.
 
