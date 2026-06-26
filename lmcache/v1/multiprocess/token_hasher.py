@@ -34,6 +34,8 @@ def _make_blake3_hash_func() -> Callable:
     # Third Party
     import blake3 as _blake3
 
+    extended_token_marker = b"LMC-u64"
+
     def blake3_hash(args):
         prefix_hash, tokens, _ = args
         h = _blake3.blake3()
@@ -44,8 +46,14 @@ def _make_blake3_hash_func() -> Callable:
             h.update(prefix_hash.to_bytes(8, byteorder="big", signed=True))
         else:
             h.update(bytes(prefix_hash))
-        # Serialize token IDs in one batch
-        h.update(struct.pack(f">{len(tokens)}I", *tokens))
+        # Preserve the original 32-bit encoding for normal text tokens so
+        # existing text-only cache keys stay stable. Use an explicit marker plus
+        # uint64 packing only when multimodal surrogate ids exceed uint32.
+        if all(0 <= token <= 0xFFFFFFFF for token in tokens):
+            h.update(struct.pack(f">{len(tokens)}I", *tokens))
+        else:
+            h.update(extended_token_marker)
+            h.update(struct.pack(f">{len(tokens)}Q", *tokens))
         return h.digest()  # 32 bytes
 
     return blake3_hash

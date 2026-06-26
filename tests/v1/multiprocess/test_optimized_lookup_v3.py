@@ -372,6 +372,20 @@ def _chunk(seed: int) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+def test_vlm_surrogate_identity_distinguishes_images() -> None:
+    """Large multimodal surrogate ids are part of the V3 matcher identity."""
+    matcher = BlendTokenRangeMatcherV3(chunk_size=3)
+    same_image_tokens = [101, 2**40 + 123, 2**40 + 123]
+    different_image_tokens = [101, 2**40 + 456, 2**40 + 456]
+    chunk_hash = b"image-a-chunk"
+
+    matcher.on_new_token_hashes(same_image_tokens, [chunk_hash])
+
+    same_matches = matcher.match_sub_sequence(same_image_tokens)
+    assert [(x.hash, x.old_st, x.cur_st) for x in same_matches] == [(chunk_hash, 0, 0)]
+    assert matcher.match_sub_sequence(different_image_tokens) == []
+
+
 class TestOptimizedLookupEquivalence:
     """Same matcher, two lookup paths — outputs must be equivalent."""
 
