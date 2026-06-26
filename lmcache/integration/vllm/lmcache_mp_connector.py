@@ -46,7 +46,12 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
 )
-from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
+from lmcache.integration.vllm.utils import (
+    apply_mm_hashes_to_token_list,
+    extract_mm_features,
+    mla_enabled,
+    vllm_layout_hints,
+)
 from lmcache.utils import init_logger as lmcache_init_logger
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 
@@ -93,6 +98,7 @@ if TYPE_CHECKING:
         PromMetricT,
     )
     from vllm.forward_context import ForwardContext
+    from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -186,6 +192,15 @@ class LMCacheMPRequestTracker:
     # Read-only list to track the token ids
     all_token_ids: ConstantList[int]
 
+    # VLM-aware token ids used only for LMCache keys, CacheBlend matching,
+    # lookup locks, and cache observability.
+    cache_token_ids: list[int]
+
+    # Multimodal identity metadata used to refresh cache_token_ids when vLLM
+    # appends generated tokens to all_token_ids after tracker construction.
+    mm_hashes: list[str]
+    mm_positions: list["PlaceholderRange"]
+
     # Block ids will be updated at update_states_after_alloc and
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
@@ -212,6 +227,8 @@ class LMCacheMPRequestTracker:
         self.request_id = request.request_id
         self.cache_salt: str = request.cache_salt or ""
         self.all_token_ids = request.all_token_ids
+        self.mm_hashes, self.mm_positions = extract_mm_features(request)
+        self.cache_token_ids = self._build_cache_token_ids()
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
@@ -268,6 +285,20 @@ class LMCacheMPRequestTracker:
             for engine_group_idx, blocks in self.allocated_block_ids.items()
         }
 
+    def get_cache_token_ids(self) -> list[int]:
+        """Return VLM-aware cache token ids aligned to current raw tokens.
+
+        vLLM may append generated tokens to ``all_token_ids`` after tracker
+        construction. Generated tokens are not covered by multimodal
+        placeholders, but they still need to be present in LMCache keys if a
+        later store spans them.
+
+        Returns:
+            The refreshed cache token id list.
+        """
+        self.cache_token_ids = self._build_cache_token_ids()
+        return self.cache_token_ids
+
     ####
     # For debugging
     ####
@@ -285,6 +316,14 @@ class LMCacheMPRequestTracker:
 
     def __str__(self) -> str:
         return self.__repr__()
+
+    def _build_cache_token_ids(self) -> list[int]:
+        token_ids = list(self.all_token_ids)
+        if not self.mm_hashes or not self.mm_positions:
+            return token_ids
+        return apply_mm_hashes_to_token_list(
+            token_ids, self.mm_hashes, self.mm_positions
+        )
 
 
 @dataclass
@@ -367,7 +406,7 @@ class LMCacheMPRequestMetadata:
                 start_token_idx,
                 end_token_idx,
             )
-            token_ids = list(tracker.all_token_ids)
+            token_ids = list(tracker.get_cache_token_ids())
             op = LoadStoreOp(
                 token_ids=token_ids,
                 block_ids=block_ids,
@@ -434,7 +473,7 @@ class LMCacheMPRequestMetadata:
                 start_token_idx,
                 end_token_idx,
             )
-            token_ids = list(tracker.all_token_ids)
+            token_ids = list(tracker.get_cache_token_ids())
 
             # Compute how many tokens at the start of the retrieve range
             # overlap with APC-shared blocks. The server must skip writing
@@ -910,7 +949,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=list(request.all_token_ids),
+            token_ids=list(tracker.get_cache_token_ids()),
             cache_salt=tracker.cache_salt,
         )
 
@@ -1011,7 +1050,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
                 if free_end > 0:
                     self.scheduler_adapter.free_lookup_locks(
-                        token_ids=list(tracker.all_token_ids),
+                        token_ids=list(tracker.get_cache_token_ids()),
                         start=0,
                         end=free_end,
                         request_id=request.request_id,
@@ -1274,7 +1313,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 RequestAllocationRecord(
                     req_id=new_request.req_id,
                     new_block_ids=list(primary_block_ids),
-                    new_token_ids=list(tracker.all_token_ids[:total_tokens]),
+                    new_token_ids=list(tracker.get_cache_token_ids()[:total_tokens]),
                 )
             )
 
@@ -1299,7 +1338,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tokens_per_block = self._group_tokens_per_block[0]
             start_token = (total_blocks - num_new_blocks) * tokens_per_block
             end_token = total_blocks * tokens_per_block
-            new_token_ids = list(tracker.all_token_ids[start_token:end_token])
+            new_token_ids = list(tracker.get_cache_token_ids()[start_token:end_token])
             records.append(
                 RequestAllocationRecord(
                     req_id=request_id,
